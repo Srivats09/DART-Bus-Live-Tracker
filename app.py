@@ -144,15 +144,7 @@ HTML_TEMPLATE = """
         item.onclick = () => selectRoute(route.route_id, item);
         routeList.appendChild(item);
       });
-    });
-    function selectRoute(routeId, element) {
-      selectedRouteId = routeId; selectedDirectionId = null; hideStopPanel();
-      document.querySelectorAll('#route-list div').forEach(el => el.classList.remove('bg-blue-100','font-semibold'));
-      element.classList.add('bg-blue-100','font-semibold');
-      routeShapeLayer.clearLayers(); stopsLayer.clearLayers(); vehiclesLayer.clearLayers();
-      const dirC = document.getElementById('directions-container');
-      dirC.innerHTML = '<p class="text-gray-500">Loading…</p>';
-      fetch(`/api/route_directions/${routeId}`).then(r=>r.json()).then(directions=>{
+      fetch(`/api/route_directions/${route_id}`).then(r=>r.json()).then(directions=>{
         dirC.innerHTML = '';
         if(!directions.length) { dirC.innerHTML = '<p class="text-red-500">No directions found.</p>'; return; }
         directions.forEach(dir=>{
@@ -167,8 +159,17 @@ HTML_TEMPLATE = """
     }
     function selectDirection(directionId, btn) {
         selectedDirectionId = directionId;
-        document.querySelectorAll('#directions-container button').forEach(el => el.classList.remove('bg-blue-600', 'text-white'));
-        btn.classList.add('bg-blue-600', 'text-white');
+        
+        // Reset all buttons to their default (gray) state
+        document.querySelectorAll('#directions-container button').forEach(el => {
+            el.classList.remove('bg-blue-600', 'text-white', 'font-bold');
+            el.classList.add('bg-gray-100', 'hover:bg-gray-200', 'font-medium');
+        });
+
+        // Apply active (blue) styles to the selected button
+        btn.classList.add('bg-blue-600', 'text-white', 'font-bold');
+        btn.classList.remove('bg-gray-100', 'hover:bg-gray-200', 'font-medium');
+
         if (isMobile()) hideSidebar();
         hideStopPanel(); routeShapeLayer.clearLayers(); stopsLayer.clearLayers();
         fetch(`/api/direction_details?route=${selectedRouteId}&direction=${selectedDirectionId}`).then(r => r.json()).then(data => {
@@ -361,4 +362,5 @@ process_gtfs_data()
 if __name__ == "__main__":
     # The app.run() is only for local development.
     app.run(debug=True, port=5000)
+
 
