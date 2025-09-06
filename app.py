@@ -7,7 +7,7 @@ from math import radians, cos, sin, asin, sqrt
 import geojson
 import pandas as pd
 import requests
-import pytz  # <-- IMPORT THE TIMEZONE LIBRARY
+import pytz
 from flask import Flask, jsonify, request, Response
 from google.transit import gtfs_realtime_pb2
 
@@ -110,9 +110,9 @@ HTML_TEMPLATE = """
 <body class="relative overflow-hidden">
   <div id="map" class="w-full h-screen z-0"></div>
   <div id="map-overlay" class="hidden md:hidden fixed inset-0 bg-black bg-opacity-50 z-20 transition-opacity duration-300"></div>
-  <button id="menu-toggle" class="md:hidden absolute top-4 left-4 z-10 bg-white p-2.5 rounded-md shadow-lg"><svg xmlns="http://www.w.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16m-7 6h7" /></svg></button>
+  <button id="menu-toggle" class="md:hidden absolute top-4 left-4 z-10 bg-white p-2.5 rounded-md shadow-lg"><svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16m-7 6h7" /></svg></button>
   <div id="sidebar" class="absolute top-0 left-0 h-screen w-full max-w-sm md:w-[380px] bg-white shadow-lg z-30 p-4 flex flex-col transform -translate-x-full md:translate-x-0 transition-transform duration-300 ease-in-out">
-    <div class="flex items-center justify-between border-b pb-2 mb-2"><h1 class="text-2xl font-bold">DART Routes</h1><button id="close-sidebar" class="md:hidden p-1"><svg xmlns="http://www.w.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg></button></div>
+    <div class="flex items-center justify-between border-b pb-2 mb-2"><h1 class="text-2xl font-bold">DART Routes</h1><button id="close-sidebar" class="md:hidden p-1"><svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg></button></div>
     <div id="directions-container" class="border-b pb-2"></div><div id="route-list" class="flex-grow overflow-y-auto mt-3 custom-scrollbar"></div>
   </div>
   <div id="stop-panel" class="absolute top-0 right-0 h-screen w-full max-w-sm md:w-[380px] bg-white shadow-lg z-30 p-4 flex flex-col transform translate-x-full transition-transform duration-300 ease-in-out">
@@ -134,6 +134,7 @@ HTML_TEMPLATE = """
     function showStopPanel() { stopPanel.classList.remove('translate-x-full'); if(isMobile()) mapOverlay.classList.remove('hidden'); }
     function hideStopPanel() { stopPanel.classList.add('translate-x-full'); mapOverlay.classList.add('hidden'); }
     menuToggleBtn.onclick = showSidebar; closeSidebarBtn.onclick = hideSidebar; closeStopPanelBtn.onclick = hideStopPanel; mapOverlay.onclick = () => { hideSidebar(); hideStopPanel(); };
+    
     fetch('/api/routes').then(r => r.json()).then(routes => {
       routes.sort((a,b)=> (parseInt(a.route_short_name,10)||a.route_short_name).toString().localeCompare((parseInt(b.route_short_name,10)||b.route_short_name).toString(), undefined, {numeric: true}));
       const routeList = document.getElementById('route-list');
@@ -144,7 +145,16 @@ HTML_TEMPLATE = """
         item.onclick = () => selectRoute(route.route_id, item);
         routeList.appendChild(item);
       });
-      fetch(`/api/route_directions/${route_id}`).then(r=>r.json()).then(directions=>{
+    });
+
+    function selectRoute(routeId, element) {
+      selectedRouteId = routeId; selectedDirectionId = null; hideStopPanel();
+      document.querySelectorAll('#route-list div').forEach(el => el.classList.remove('bg-blue-100','font-semibold'));
+      element.classList.add('bg-blue-100','font-semibold');
+      routeShapeLayer.clearLayers(); stopsLayer.clearLayers(); vehiclesLayer.clearLayers();
+      const dirC = document.getElementById('directions-container');
+      dirC.innerHTML = '<p class="text-gray-500">Loading…</p>';
+      fetch(`/api/route_directions/${routeId}`).then(r=>r.json()).then(directions=>{
         dirC.innerHTML = '';
         if(!directions.length) { dirC.innerHTML = '<p class="text-red-500">No directions found.</p>'; return; }
         directions.forEach(dir=>{
@@ -157,16 +167,15 @@ HTML_TEMPLATE = """
         if (dirC.firstChild) dirC.firstChild.click();
       });
     }
+
     function selectDirection(directionId, btn) {
         selectedDirectionId = directionId;
         
-        // Reset all buttons to their default (gray) state
         document.querySelectorAll('#directions-container button').forEach(el => {
             el.classList.remove('bg-blue-600', 'text-white', 'font-bold');
             el.classList.add('bg-gray-100', 'hover:bg-gray-200', 'font-medium');
         });
 
-        // Apply active (blue) styles to the selected button
         btn.classList.add('bg-blue-600', 'text-white', 'font-bold');
         btn.classList.remove('bg-gray-100', 'hover:bg-gray-200', 'font-medium');
 
@@ -179,19 +188,21 @@ HTML_TEMPLATE = """
         if (vehicleUpdateInterval) clearInterval(vehicleUpdateInterval);
         vehicleUpdateInterval = setInterval(loadVehicleData, 15000);
     }
+
     function loadVehicleData() {
       if(!selectedRouteId || selectedDirectionId===null) return;
       fetch(`/api/vehicles?route=${selectedRouteId}&direction=${selectedDirectionId}`).then(r=>r.json()).then(fc=>{
         vehiclesLayer.clearLayers();
         L.geoJSON(fc, { pointToLayer: (feat, latlng) => {
           const bearing = feat.properties.bearing || 0, dir = selectedDirectionId, path = "M12 2 L22 19 L12 14 L2 19 Z";
-          const iconHtml = `<svg xmlns="http://www.w.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" style="transform: rotate(${bearing}deg);"><path d="${path}" fill="${dir===0?'#000':'#FFF'}" stroke="${dir===0?'#FFF':'#000'}" stroke-width="1.5"/></svg>`;
+          const iconHtml = `<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" style="transform: rotate(${bearing}deg);"><path d="${path}" fill="${dir===0?'#000':'#FFF'}" stroke="${dir===0?'#FFF':'#000'}" stroke-width="1.5"/></svg>`;
           const marker = L.marker(latlng, { icon: L.divIcon({ html: iconHtml, className: '', iconSize: [28, 28], iconAnchor: [14, 14] }) });
           marker.on('click', () => showPredictionsForVehicle(feat.properties));
           return marker;
         }}).addTo(vehiclesLayer);
       }).catch(e=>console.error('Vehicle fetch error:', e));
     }
+    
     function showPredictionsForVehicle(props) {
         showStopPanel();
         stopPanelTitle.textContent = `Stops for Vehicle ${props.vehicle_id}`;
@@ -362,5 +373,4 @@ process_gtfs_data()
 if __name__ == "__main__":
     # The app.run() is only for local development.
     app.run(debug=True, port=5000)
-
 
