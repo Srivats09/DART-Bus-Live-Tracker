@@ -624,7 +624,12 @@ def api_vehicle_predictions():
 # -------------------------------------------------------------------
 # Main
 # -------------------------------------------------------------------
+
+# This will run once when the server starts, loading all the GTFS data.
+process_gtfs_data()
+
 if __name__ == "__main__":
-    process_gtfs_data()
+    # The app.run() is only for local development.
     app.run(debug=True, port=5000)
+
 
