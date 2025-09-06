@@ -15,7 +15,7 @@ from google.transit import gtfs_realtime_pb2
 # -------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-STATIC_GTFS_URL = "https://tmc.deldot.gov/gtfs/dart.zip"
+STATIC_GTFS_URL = "https://dartfirststate.com/RiderInfo/Routes/gtfs_data/dartfirststate_de_us.zip"
 GTFS_RT_URL = "https://tmc.deldot.gov/gtfs/VehiclePositions.pb"
 
 # a sane fallback speed when GTFS-RT has no speed (m/s). ~15 mph.
@@ -627,3 +627,4 @@ def api_vehicle_predictions():
 if __name__ == "__main__":
     process_gtfs_data()
     app.run(debug=True, port=5000)
+
