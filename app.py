@@ -105,14 +105,7 @@ HTML_TEMPLATE = """
     body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji"; }
     .custom-scrollbar::-webkit-scrollbar { width: 6px; } .custom-scrollbar::-webkit-scrollbar-thumb { background: #c5c5c5; border-radius: 3px; }
     .leaflet-popup-content-wrapper { border-radius: 10px; }
-    .leaflet-control-locate a {
-        font-size: 1.4rem;
-        color: #333;
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-    }
+    .leaflet-control-locate a { font-size: 1.4rem; color: #333; cursor: pointer; display: flex; align-items: center; justify-content: center; }
     .leaflet-control-locate a:hover { color: #0078A8; }
   </style>
 </head>
@@ -120,12 +113,12 @@ HTML_TEMPLATE = """
   <div id="map" class="w-full h-screen z-0"></div>
   <div id="map-overlay" class="hidden md:hidden fixed inset-0 bg-black bg-opacity-50 z-20 transition-opacity duration-300"></div>
 
-  <!-- CHANGE: Floating instruction hint -->
-  <div id="instruction-hint" class="absolute bottom-4 md:bottom-6 left-1/2 -translate-x-1/2 w-11/12 max-w-md bg-white/90 backdrop-blur-sm p-3 rounded-lg shadow-xl z-10 text-center text-sm text-gray-800 flex items-center justify-between transition-opacity duration-500 ease-in-out">
+  <!-- CHANGE: Hint is now at the top and starts hidden -->
+  <div id="instruction-hint" class="absolute top-4 left-1/2 -translate-x-1/2 w-11/12 max-w-md bg-white/90 backdrop-blur-sm p-3 rounded-lg shadow-xl z-10 text-center text-sm text-gray-800 flex items-center justify-between transition-opacity duration-500 ease-in-out opacity-0 pointer-events-none">
     <span class="flex-grow">
-      Select a route, then tap a bus icon
+      Now, tap a bus icon
       <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" class="inline-block -mt-1 mx-0.5"><path d="M12 2 L22 19 L12 14 L2 19 Z" fill="#000" stroke="#FFF" stroke-width="1.5"/></svg>
-      to see its live stops.
+      on the map to see its live stops.
     </span>
     <button id="close-hint-btn" class="ml-2 text-2xl font-light text-gray-400 hover:text-gray-700 leading-none p-1">&times;</button>
   </div>
@@ -158,12 +151,12 @@ HTML_TEMPLATE = """
     function isMobile() { return window.innerWidth < 768; }
     function showSidebar() { sidebar.classList.remove('-translate-x-full'); if(isMobile()) mapOverlay.classList.remove('hidden'); }
     function hideSidebar() { sidebar.classList.add('-translate-x-full'); mapOverlay.classList.add('hidden'); }
-    function showStopPanel() { stopPanel.classList.remove('translate-x-full'); if(isMobile()) mapOverlay.classList.remove('hidden'); }
+    function showStopPanel() { stopPanel.classList.remove('translate-x-full'); if(isMobile()) mapOverlay.classList.remove('hidden'); hideHint(); }
     function hideStopPanel() { stopPanel.classList.add('translate-x-full'); mapOverlay.classList.add('hidden'); }
+    function showHint() { instructionHint.classList.remove('opacity-0', 'pointer-events-none'); }
     function hideHint() { instructionHint.classList.add('opacity-0', 'pointer-events-none'); }
     menuToggleBtn.onclick = showSidebar; closeSidebarBtn.onclick = hideSidebar; closeStopPanelBtn.onclick = hideStopPanel; mapOverlay.onclick = () => { hideSidebar(); hideStopPanel(); };
     closeHintBtn.onclick = hideHint;
-    setTimeout(hideHint, 12000); // Hide hint automatically
 
     L.Control.Locate = L.Control.extend({
         onAdd: function(map) {
@@ -171,17 +164,38 @@ HTML_TEMPLATE = """
             const link = L.DomUtil.create('a', '', container);
             link.href = '#';
             link.title = 'Find my location';
-            // --- CHANGE: Updated GPS Icon to a more standard one ---
             link.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 8c-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4-1.79-4-4-4zm8.94 3c-.46-4.17-3.77-7.48-7.94-7.94V1h-2v2.06C6.83 3.52 3.52 6.83 3.06 11H1v2h2.06c.46 4.17 3.77 7.48 7.94 7.94V23h2v-2.06c4.17-.46 7.48-3.77 7.94-7.94H23v-2h-2.06zM12 19c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/></svg>';
             L.DomEvent.on(link, 'click', L.DomEvent.stop).on(link, 'click', this.locate, this);
             return container;
         },
-        locate: function() { /* ... unchanged ... */ }
+        locate: function() {
+            navigator.geolocation.getCurrentPosition(
+                (position) => {
+                    const latlng = [position.coords.latitude, position.coords.longitude];
+                    if (!userLocationMarker) {
+                        userLocationMarker = L.circleMarker(latlng, { radius: 8, color: '#1d4ed8', fillColor: '#60a5fa', fillOpacity: 0.8 }).addTo(map);
+                    } else {
+                        userLocationMarker.setLatLng(latlng);
+                    }
+                    map.setView(latlng, 15);
+                },
+                () => { alert("Could not get your location. Please grant permission in your browser settings."); },
+                { enableHighAccuracy: true }
+            );
+        }
     });
     new L.Control.Locate({ position: 'topright' }).addTo(map);
 
     fetch('/api/routes').then(r => r.json()).then(routes => {
-      routes.sort((a,b)=> (parseInt(a.route_short_name,10)||a.route_short_name).toString().localeCompare((parseInt(b.route_short_name,10)||b.route_short_name).toString(), undefined, {numeric: true}));
+      // FIX: Simplified the sort function to be more robust and prevent errors.
+      routes.sort((a, b) => {
+        const na = parseInt(a.route_short_name, 10);
+        const nb = parseInt(b.route_short_name, 10);
+        if (!isNaN(na) && !isNaN(nb)) {
+            return na - nb;
+        }
+        return (a.route_short_name || '').localeCompare(b.route_short_name || '');
+      });
       const routeList = document.getElementById('route-list');
       routes.forEach(route => {
         const item = document.createElement('div');
@@ -193,7 +207,6 @@ HTML_TEMPLATE = """
     });
 
     function selectRoute(routeId, element) {
-      hideHint(); // Hide hint on first interaction
       selectedRouteId = routeId; selectedDirectionId = null; hideStopPanel();
       document.querySelectorAll('#route-list div').forEach(el => el.classList.remove('bg-blue-100','font-semibold'));
       element.classList.add('bg-blue-100','font-semibold');
@@ -214,53 +227,16 @@ HTML_TEMPLATE = """
       });
     }
 
-    // Unchanged functions: selectDirection, loadVehicleData, showPredictionsForVehicle
-    function selectDirection(directionId, btn) { /* ... unchanged ... */ }
-    function loadVehicleData() { /* ... unchanged ... */ }
-    function showPredictionsForVehicle(props) { /* ... unchanged ... */ }
-  </script>
-</body>
-</html>
-"""
-# The rest of the Python code is unchanged. I will omit it for brevity
-# but it should be included in the final file.
-# ... (rest of Flask routes and main execution block) ...
-app = Flask(__name__)
-
-# --- Re-add the unchanged functions that were omitted in the script block for brevity ---
-
-# This locate function was inside L.Control.Locate and is unchanged.
-def locate_js_placeholder():
-    """
-        locate: function() {
-            navigator.geolocation.getCurrentPosition(
-                (position) => {
-                    const latlng = [position.coords.latitude, position.coords.longitude];
-                    if (!userLocationMarker) {
-                        userLocationMarker = L.circleMarker(latlng, { radius: 8, color: '#1d4ed8', fillColor: '#60a5fa', fillOpacity: 0.8 }).addTo(map);
-                    } else {
-                        userLocationMarker.setLatLng(latlng);
-                    }
-                    map.setView(latlng, 15);
-                },
-                () => {
-                    console.warn("Could not get user location. Please grant permission.");
-                }, { enableHighAccuracy: true }
-            );
-        }
-    """
-    pass
-
-def selectDirection_js_placeholder():
-    """
     function selectDirection(directionId, btn) {
         selectedDirectionId = directionId;
+        // This logic correctly styles the selected direction button
         document.querySelectorAll('#directions-container button').forEach(el => {
             el.classList.remove('bg-blue-600', 'text-white', 'font-bold');
             el.classList.add('bg-gray-100', 'hover:bg-gray-200', 'font-medium');
         });
         btn.classList.add('bg-blue-600', 'text-white', 'font-bold');
         btn.classList.remove('bg-gray-100', 'hover:bg-gray-200', 'font-medium');
+        
         if (isMobile()) hideSidebar();
         hideStopPanel(); routeShapeLayer.clearLayers(); stopsLayer.clearLayers();
         fetch(`/api/direction_details?route=${selectedRouteId}&direction=${selectedDirectionId}`).then(r => r.json()).then(data => {
@@ -269,12 +245,9 @@ def selectDirection_js_placeholder():
         loadVehicleData();
         if (vehicleUpdateInterval) clearInterval(vehicleUpdateInterval);
         vehicleUpdateInterval = setInterval(loadVehicleData, 15000);
+        showHint(); // Show the floating hint
     }
-    """
-    pass
 
-def loadVehicleData_js_placeholder():
-    """
     function loadVehicleData() {
       if(!selectedRouteId || selectedDirectionId===null) return;
       fetch(`/api/vehicles?route=${selectedRouteId}&direction=${selectedDirectionId}`).then(r=>r.json()).then(fc=>{
@@ -288,11 +261,7 @@ def loadVehicleData_js_placeholder():
         }}).addTo(vehiclesLayer);
       }).catch(e=>console.error('Vehicle fetch error:', e));
     }
-    """
-    pass
-
-def showPredictionsForVehicle_js_placeholder():
-    """
+    
     function showPredictionsForVehicle(props) {
         showStopPanel();
         stopPanelTitle.textContent = `Stops for Vehicle ${props.vehicle_id}`;
@@ -338,9 +307,15 @@ def showPredictionsForVehicle_js_placeholder():
             });
         }).catch(e => { console.error('Prediction error:', e); stopListEl.innerHTML = '<p class="text-red-500 py-4">Could not load.</p>'; });
     }
-    """
-    pass
+  </script>
+</body>
+</html>
+"""
+app = Flask(__name__)
 
+# -------------------------------------------------------------------
+# API Routes
+# -------------------------------------------------------------------
 @app.route("/")
 def index(): return Response(HTML_TEMPLATE, mimetype="text/html")
 
@@ -472,5 +447,4 @@ process_gtfs_data()
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
-
 
