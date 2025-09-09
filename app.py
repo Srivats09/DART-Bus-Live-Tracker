@@ -17,7 +17,7 @@ from google.transit import gtfs_realtime_pb2
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 STATIC_GTFS_URL = "https://dartfirststate.com/RiderInfo/Routes/gtfs_data/dartfirststate_de_us.zip"
-GTFS_RT_URL = "https://api.goswift.ly/real-time/delaware/gtfs-rt-vehicle-positions"
+GTFS_RT_URL = "https://tmc.deldot.gov/gtfs/VehiclePositions.pb"
 DEFAULT_SPEED_MS = 6.7
 gtfs_data = {}
 
@@ -472,4 +472,5 @@ process_gtfs_data()
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
+
 
