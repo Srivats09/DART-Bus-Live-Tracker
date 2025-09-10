@@ -21,6 +21,7 @@ GTFS_RT_URL = "https://tmc.deldot.gov/gtfs/VehiclePositions.pb"
 DEFAULT_SPEED_MS = 6.7
 gtfs_data = {}
 
+
 # -------------------------------------------------------------------
 # Geo helpers
 # -------------------------------------------------------------------
@@ -28,17 +29,19 @@ def haversine(lon1, lat1, lon2, lat2):
     lon1, lat1, lon2, lat2 = map(radians, [lon1, lat1, lon2, lat2])
     dlon = lon2 - lon1
     dlat = lat2 - lat1
-    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
     c = 2 * asin(sqrt(a))
     r = 6371000
     return c * r
 
+
 def cumulative_distances(coords):
     dists = [0.0]
     for i in range(1, len(coords)):
-        d = haversine(coords[i-1][0], coords[i-1][1], coords[i][0], coords[i][1])
+        d = haversine(coords[i - 1][0], coords[i - 1][1], coords[i][0], coords[i][1])
         dists.append(dists[-1] + d)
     return dists
+
 
 def nearest_shape_index(coords, point):
     plon, plat = point
@@ -49,6 +52,16 @@ def nearest_shape_index(coords, point):
             best_d, best_i = d, i
     return best_i
 
+
+def find_gtfs_file(zip_file, file_name):
+    for name in zip_file.namelist():
+        if name.endswith('/' + file_name):
+            return name
+    if file_name in zip_file.namelist():
+        return file_name
+    raise FileNotFoundError(f"Could not find {file_name} in the zip archive.")
+
+
 # -------------------------------------------------------------------
 # GTFS processing
 # -------------------------------------------------------------------
@@ -57,48 +70,62 @@ def process_gtfs_data():
     r = requests.get(STATIC_GTFS_URL, timeout=60)
     r.raise_for_status()
 
-    # --- CHANGE: This function is now fully service-aware ---
     with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-        # 1. Read all necessary files, including calendar files
-        routes_df = pd.read_csv(z.open("routes.txt"), dtype={"route_id": str})
-        trips_df = pd.read_csv(z.open("trips.txt"), dtype={"trip_id": str, "service_id": str})
-        calendar_df = pd.read_csv(z.open("calendar.txt"), dtype=str)
-        calendar_dates_df = pd.read_csv(z.open("calendar_dates.txt"), dtype=str)
-        
-        # 2. Determine today's active service IDs
+        try:
+            routes_path = find_gtfs_file(z, "routes.txt")
+            trips_path = find_gtfs_file(z, "trips.txt")
+            calendar_path = find_gtfs_file(z, "calendar.txt")
+            calendar_dates_path = find_gtfs_file(z, "calendar_dates.txt")
+            stop_times_path = find_gtfs_file(z, "stop_times.txt")
+            stops_path = find_gtfs_file(z, "stops.txt")
+            shapes_path = find_gtfs_file(z, "shapes.txt")
+        except FileNotFoundError as e:
+            logging.error(f"Critical GTFS file missing: {e}")
+            return
+
+        routes_df = pd.read_csv(z.open(routes_path), dtype=str)
+        trips_df = pd.read_csv(z.open(trips_path), dtype=str)
+        calendar_df = pd.read_csv(z.open(calendar_path), dtype=str)
+        calendar_dates_df = pd.read_csv(z.open(calendar_dates_path), dtype=str)
+        stop_times_df = pd.read_csv(z.open(stop_times_path), dtype=str)
+
+        # Clean all linking IDs to prevent mismatches
+        for df in [routes_df, trips_df, stop_times_df]:
+            for col in ['route_id', 'trip_id', 'service_id']:
+                if col in df.columns:
+                    df[col] = df[col].astype(str).str.strip()
+
         ET = pytz.timezone('America/New_York')
         today = datetime.now(ET)
         today_str = today.strftime('%Y%m%d')
-        today_weekday = today.strftime('%A').lower() # e.g., 'wednesday'
+        today_weekday = today.strftime('%A').lower()
 
-        # Get services from the regular weekly schedule (calendar.txt)
         active_weekly_services = calendar_df[
             (calendar_df[today_weekday] == '1') &
             (calendar_df['start_date'] <= today_str) &
             (calendar_df['end_date'] >= today_str)
-        ]
+            ]
         active_service_ids = set(active_weekly_services['service_id'])
 
-        # Apply exceptions for today (calendar_dates.txt)
         today_exceptions = calendar_dates_df[calendar_dates_df['date'] == today_str]
         for _, row in today_exceptions.iterrows():
-            if row['exception_type'] == '1': # Service added
+            if row['exception_type'] == '1':
                 active_service_ids.add(row['service_id'])
-            elif row['exception_type'] == '2': # Service removed
+            elif row['exception_type'] == '2':
                 active_service_ids.discard(row['service_id'])
-        
-        logging.info(f"Found {len(active_service_ids)} active services for today.")
 
-        # 3. Filter trips to only include those running today
-        trips_df = trips_df[trips_df['service_id'].isin(active_service_ids)]
-        logging.info(f"Filtered to {len(trips_df)} trips running today.")
-        
-        # 4. Continue processing with the filtered data
-        gtfs_data["routes"] = routes_df[["route_id", "route_short_name", "route_long_name"]].to_dict("records")
-        gtfs_data["stop_times_df"] = pd.read_csv(z.open("stop_times.txt"), dtype={"trip_id": str, "stop_id": str})
-        gtfs_data["stops_dict"] = pd.read_csv(z.open("stops.txt"), dtype={"stop_id": str}).set_index("stop_id").to_dict("index")
+        logging.info(f"Found {len(active_service_ids)} active services for today.")
+        active_trips_df = trips_df[trips_df['service_id'].isin(active_service_ids)]
+        logging.info(f"Filtered to {len(active_trips_df)} trips for building today's route list.")
+
+        # Store the COMPLETE, UNFILTERED trips dataframe for robust stop lookups.
         gtfs_data["trips_df"] = trips_df.set_index("trip_id")
-        shapes_df = pd.read_csv(z.open("shapes.txt"), dtype={"shape_id": str})
+
+        gtfs_data["routes_dict"] = routes_df.set_index('route_id').to_dict('index')
+        gtfs_data["stop_times_df"] = stop_times_df
+        gtfs_data["stops_dict"] = pd.read_csv(z.open(stops_path), dtype={"stop_id": str}).set_index("stop_id").to_dict(
+            "index")
+        shapes_df = pd.read_csv(z.open(shapes_path), dtype={"shape_id": str})
 
     shapes = {}
     for shape_id, group in shapes_df.groupby("shape_id"):
@@ -108,9 +135,8 @@ def process_gtfs_data():
     gtfs_data["shapes"] = shapes
 
     route_info = {}
-    # Use the already-filtered trips_df for this step
-    trips_with_shape = gtfs_data["trips_df"].reset_index().dropna(subset=["shape_id", "direction_id"])
-    logging.info("Building route/direction info based on today's trips…")
+    trips_with_shape = active_trips_df.dropna(subset=["shape_id", "direction_id"])
+    logging.info("Building route/direction info based on today's scheduled trips…")
     for (route_id, direction_id), group in trips_with_shape.groupby(["route_id", "direction_id"]):
         if route_id not in route_info: route_info[route_id] = {}
         mode_shape = group["shape_id"].mode()
@@ -119,11 +145,7 @@ def process_gtfs_data():
         if shape_id not in shapes: continue
         hs_mode = group["trip_headsign"].mode()
         headsign = hs_mode.iloc[0] if not hs_mode.empty else "Unknown Destination"
-        route_info[route_id][int(direction_id)] = {
-            "shape_id": shape_id,
-            "headsign": headsign,
-            "trip_ids": set(group['trip_id'].unique())
-        }
+        route_info[route_id][int(direction_id)] = {"shape_id": shape_id, "headsign": headsign}
     gtfs_data["route_info"] = route_info
     logging.info("GTFS static loaded and filtered for today's service.")
 
@@ -159,7 +181,7 @@ HTML_TEMPLATE = """
     </span>
     <button id="close-hint-btn" class="ml-2 text-2xl font-light text-gray-400 hover:text-gray-700 leading-none p-1">&times;</button>
   </div>
-  
+
   <button id="menu-toggle" class="md:hidden absolute top-4 left-4 z-10 bg-white p-2.5 rounded-md shadow-lg"><svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16m-7 6h7" /></svg></button>
   <div id="sidebar" class="absolute top-0 left-0 h-screen w-full max-w-sm md:w-[380px] bg-white shadow-lg z-30 p-4 flex flex-col transform -translate-x-full md:translate-x-0 transition-transform duration-300 ease-in-out">
     <div class="flex items-center justify-between border-b pb-2 mb-2">
@@ -171,7 +193,12 @@ HTML_TEMPLATE = """
     <div id="route-list" class="flex-grow overflow-y-auto mt-3 custom-scrollbar"></div>
   </div>
   <div id="stop-panel" class="absolute top-0 right-0 h-screen w-full max-w-sm md:w-[380px] bg-white shadow-lg z-30 p-4 flex flex-col transform translate-x-full transition-transform duration-300 ease-in-out">
-    <div class="flex items-center justify-between border-b pb-2"><h2 id="stop-panel-title" class="text-xl font-semibold">Upcoming Stops</h2><button id="close-stop-panel" class="text-sm px-3 py-1.5 rounded-md bg-gray-200 hover:bg-gray-300">Close</button></div>
+    <div class="flex items-center justify-between border-b pb-2">
+        <div id="stop-panel-title">
+            <h2 class="text-xl font-semibold">Upcoming Stops</h2>
+        </div>
+        <button id="close-stop-panel" class="text-sm px-3 py-1.5 rounded-md bg-gray-200 hover:bg-gray-300">Close</button>
+    </div>
     <div id="stop-list" class="flex-grow overflow-y-auto mt-3 custom-scrollbar"></div>
   </div>
   <script>
@@ -180,11 +207,12 @@ HTML_TEMPLATE = """
     L.tileLayer('https://tiles.stadiamaps.com/tiles/alidade_smooth/{z}/{x}/{y}{r}.png', { maxZoom: 19, attribution: '&copy; Stadia Maps &copy; OpenMapTiles &copy; OpenStreetMap' }).addTo(map);
     let vehiclesLayer = L.layerGroup().addTo(map), routeShapeLayer = L.layerGroup().addTo(map), stopsLayer = L.layerGroup().addTo(map);
     let selectedRouteId, selectedDirectionId, vehicleUpdateInterval, userLocationMarker, highlightedStopMarker;
+    let allRoutesData = [];
     const sidebar = document.getElementById('sidebar'), stopPanel = document.getElementById('stop-panel'), mapOverlay = document.getElementById('map-overlay');
     const menuToggleBtn = document.getElementById('menu-toggle'), closeSidebarBtn = document.getElementById('close-sidebar'), closeStopPanelBtn = document.getElementById('close-stop-panel');
     const stopListEl = document.getElementById('stop-list'), stopPanelTitle = document.getElementById('stop-panel-title');
     const instructionHint = document.getElementById('instruction-hint'), closeHintBtn = document.getElementById('close-hint-btn');
-    
+
     function isMobile() { return window.innerWidth < 768; }
     function showSidebar() { sidebar.classList.remove('-translate-x-full'); if(isMobile()) mapOverlay.classList.remove('hidden'); }
     function hideSidebar() { sidebar.classList.add('-translate-x-full'); mapOverlay.classList.add('hidden'); }
@@ -224,6 +252,7 @@ HTML_TEMPLATE = """
     new L.Control.Locate({ position: 'topright' }).addTo(map);
 
     fetch('/api/routes').then(r => r.json()).then(routes => {
+      allRoutesData = routes;
       routes.sort((a, b) => {
         const na = parseInt(a.route_short_name, 10);
         const nb = parseInt(b.route_short_name, 10);
@@ -231,7 +260,10 @@ HTML_TEMPLATE = """
         return (a.route_short_name || '').localeCompare(b.route_short_name || '');
       });
       const routeList = document.getElementById('route-list');
-      routeList.innerHTML = ''; // Clear previous list
+      routeList.innerHTML = '';
+      if (routes.length === 0) {
+        routeList.innerHTML = `<div class="p-3 text-center text-gray-500">No routes scheduled to run today.</div>`;
+      }
       routes.forEach(route => {
         const item = document.createElement('div');
         item.className = 'p-3 my-1 cursor-pointer hover:bg-gray-200 rounded-md';
@@ -250,7 +282,7 @@ HTML_TEMPLATE = """
       dirC.innerHTML = '<p class="text-gray-500">Loading…</p>';
       fetch(`/api/route_directions/${routeId}`).then(r=>r.json()).then(directions=>{
         dirC.innerHTML = '';
-        if(!directions.length) { dirC.innerHTML = '<p class="text-center text-gray-500 font-medium">No service for this route today.</p>'; return; }
+        if(!directions.length) { dirC.innerHTML = '<p class="text-center text-gray-500 font-medium">No directions found for today.</p>'; return; }
         directions.forEach(dir=>{
           const b=document.createElement('button');
           b.className='w-full text-left p-2 my-1 rounded-lg bg-gray-100 hover:bg-gray-200 font-medium';
@@ -270,7 +302,7 @@ HTML_TEMPLATE = """
         });
         btn.classList.add('bg-blue-600', 'text-white', 'font-bold');
         btn.classList.remove('bg-gray-100', 'hover:bg-gray-200', 'font-medium');
-        
+
         if (isMobile()) hideSidebar();
         hideStopPanel(); routeShapeLayer.clearLayers(); stopsLayer.clearLayers();
         fetch(`/api/direction_details?route=${selectedRouteId}&direction=${selectedDirectionId}`).then(r => r.json()).then(data => {
@@ -295,10 +327,18 @@ HTML_TEMPLATE = """
         }}).addTo(vehiclesLayer);
       }).catch(e=>console.error('Vehicle fetch error:', e));
     }
-    
+
     function showPredictionsForVehicle(props) {
         showStopPanel();
-        stopPanelTitle.textContent = `Stops for Vehicle ${props.vehicle_id}`;
+        const selectedRoute = allRoutesData.find(r => r.route_id === selectedRouteId);
+        const routeShortName = selectedRoute ? selectedRoute.route_short_name : '';
+        stopPanelTitle.innerHTML = `
+            <div>
+                <span class="text-xl font-semibold">Upcoming stops for Route ${routeShortName}</span>
+                <span class="block text-sm text-gray-500 font-normal">Vehicle #${props.vehicle_id}</span>
+            </div>
+        `;
+
         stopListEl.innerHTML = '<p class="py-4">Loading predictions...</p>';
         stopsLayer.clearLayers();
         if (highlightedStopMarker) {
@@ -347,24 +387,32 @@ HTML_TEMPLATE = """
 """
 app = Flask(__name__)
 
+
 # -------------------------------------------------------------------
 # API Routes
 # -------------------------------------------------------------------
 @app.route("/")
 def index(): return Response(HTML_TEMPLATE, mimetype="text/html")
 
+
 @app.route("/api/routes")
 def api_routes():
-    # --- CHANGE: Filter the routes list to only include those with active service today ---
     active_routes = []
-    all_routes = gtfs_data.get("routes", [])
+    routes_dict = gtfs_data.get("routes_dict", {})
     active_route_ids = gtfs_data.get("route_info", {}).keys()
-    
-    for route in all_routes:
-        if route['route_id'] in active_route_ids:
-            active_routes.append(route)
-            
+
+    for route_id in active_route_ids:
+        if route_id in routes_dict:
+            route_details = routes_dict[route_id]
+            active_routes.append({
+                'route_id': route_id,
+                'route_short_name': route_details.get('route_short_name'),
+                'route_long_name': route_details.get('route_long_name')
+            })
+
+    logging.info(f"Returning {len(active_routes)} active routes to the frontend.")
     return jsonify(active_routes)
+
 
 @app.route("/api/route_directions/<route_id>")
 def api_route_directions(route_id):
@@ -372,24 +420,37 @@ def api_route_directions(route_id):
     if not route_info: return jsonify([])
     return jsonify([{"direction_id": int(did), "headsign": d["headsign"]} for did, d in route_info.items()])
 
+
 @app.route("/api/direction_details")
 def api_direction_details():
     route_id = request.args.get("route")
-    try: direction_id = int(request.args.get("direction"))
-    except (ValueError, TypeError): return jsonify({"error": "Invalid direction"}), 400
+    try:
+        direction_id = int(request.args.get("direction"))
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid direction"}), 400
     details = gtfs_data.get("route_info", {}).get(route_id, {}).get(direction_id)
     if not details: return jsonify({"error": "Not found"}), 404
     shape_coords = gtfs_data["shapes"][details["shape_id"]]["coords"]
     return jsonify({"shape": geojson.LineString(shape_coords)})
 
+
 @app.route("/api/vehicles")
 def api_vehicles():
     route_id, direction_id_str = request.args.get("route"), request.args.get("direction")
-    try: direction_id = int(direction_id_str)
-    except (ValueError, TypeError): return jsonify({"error": "Invalid direction"}), 400
-    details = gtfs_data.get("route_info", {}).get(route_id, {}).get(direction_id)
-    if not details: return jsonify(geojson.FeatureCollection([]))
-    valid_trip_ids = details['trip_ids']
+    try:
+        direction_id = int(direction_id_str)
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid direction"}), 400
+
+    trips_df_reset = gtfs_data.get("trips_df").reset_index()
+    if trips_df_reset is None: return jsonify(geojson.FeatureCollection([]))
+
+    relevant_trips = trips_df_reset[
+        (trips_df_reset['route_id'] == route_id) &
+        (trips_df_reset['direction_id'] == str(direction_id))
+        ]
+    valid_trip_ids = set(relevant_trips['trip_id'])
+
     try:
         feed = gtfs_realtime_pb2.FeedMessage()
         r = requests.get(GTFS_RT_URL, timeout=15)
@@ -398,18 +459,26 @@ def api_vehicles():
         features = []
         for entity in feed.entity:
             v = entity.vehicle
-            if entity.HasField("vehicle") and v.HasField("position") and v.trip.trip_id in valid_trip_ids:
-                props = {"trip_id": v.trip.trip_id, "vehicle_id": getattr(v.vehicle, "label", v.vehicle.id), "bearing": v.position.bearing}
-                features.append(geojson.Feature(geometry=geojson.Point((v.position.longitude, v.position.latitude)), properties=props))
+            if entity.HasField("vehicle") and v.HasField("position"):
+                live_trip_id = str(v.trip.trip_id).strip()
+
+                if live_trip_id in valid_trip_ids:
+                    props = {"trip_id": live_trip_id, "vehicle_id": getattr(v.vehicle, "label", v.vehicle.id),
+                             "bearing": v.position.bearing}
+                    features.append(geojson.Feature(geometry=geojson.Point((v.position.longitude, v.position.latitude)),
+                                                    properties=props))
         return jsonify(geojson.FeatureCollection(features))
     except Exception:
         logging.exception("vehicles endpoint failed")
         return jsonify({"error": "internal error"}), 500
 
+
 @app.route("/api/vehicle_predictions")
 def api_vehicle_predictions():
     trip_id = request.args.get("trip_id")
     if not trip_id: return jsonify([])
+
+    trip_id = trip_id.strip()
 
     vehicle_pos, vehicle_speed = None, DEFAULT_SPEED_MS
     try:
@@ -418,7 +487,7 @@ def api_vehicle_predictions():
         r.raise_for_status()
         feed.ParseFromString(r.content)
         for entity in feed.entity:
-            if entity.HasField("vehicle") and entity.vehicle.trip.trip_id == trip_id:
+            if entity.HasField("vehicle") and str(entity.vehicle.trip.trip_id).strip() == trip_id:
                 vehicle_pos = (entity.vehicle.position.longitude, entity.vehicle.position.latitude)
                 if entity.vehicle.position.HasField("speed"): vehicle_speed = entity.vehicle.position.speed
                 break
@@ -430,24 +499,26 @@ def api_vehicle_predictions():
 
     try:
         trip_details = gtfs_data['trips_df'].loc[trip_id]
+
         shape_id = trip_details['shape_id']
         shape_info = gtfs_data["shapes"][shape_id]
-        trip_stop_times = gtfs_data['stop_times_df'][gtfs_data['stop_times_df'].trip_id == trip_id].sort_values("stop_sequence")
+        trip_stop_times = gtfs_data['stop_times_df'][gtfs_data['stop_times_df'].trip_id == trip_id].sort_values(
+            "stop_sequence")
         scheduled_times_map = trip_stop_times.set_index('stop_id')['arrival_time'].to_dict()
         ordered_stops = trip_stop_times["stop_id"].tolist()
     except (KeyError, IndexError):
-        logging.error(f"Could not find static details for trip_id {trip_id}")
+        logging.error(f"Could not find static details for trip_id {trip_id}. This indicates a data mismatch.")
         return jsonify([])
 
     shape_coords, shape_cumdist = shape_info["coords"], shape_info["cumdist"]
     vehicle_idx = nearest_shape_index(shape_coords, vehicle_pos)
     vehicle_dist_along_shape = shape_cumdist[vehicle_idx]
-    
+
     results = []
     ET = pytz.timezone('America/New_York')
     now_et = datetime.now(ET)
     today_midnight_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
-    
+
     for stop_id in ordered_stops:
         stop_details = gtfs_data["stops_dict"].get(stop_id)
         if not stop_details: continue
@@ -458,9 +529,10 @@ def api_vehicle_predictions():
         if stop_dist_along_shape > vehicle_dist_along_shape:
             remaining_dist = stop_dist_along_shape - vehicle_dist_along_shape
             eta_seconds = remaining_dist / (vehicle_speed if vehicle_speed > 1 else DEFAULT_SPEED_MS)
-            
+
             eta_time = now_et + timedelta(seconds=eta_seconds)
-            eta_clock = eta_time.strftime("%-I:%M %p")
+            # --- FIX: Replaced "%-I" with a cross-platform compatible method ---
+            eta_clock = eta_time.strftime("%I:%M %p").lstrip("0")
             minutes = max(1, int(round(eta_seconds / 60.0)))
             eta_text = f"{minutes} min"
 
@@ -472,7 +544,8 @@ def api_vehicle_predictions():
                     scheduled_datetime = today_midnight_et + timedelta(hours=h, minutes=m, seconds=s)
                     delay_seconds = (eta_time - scheduled_datetime).total_seconds()
                     delay_minutes = int(round(delay_seconds / 60.0))
-                    scheduled_clock = scheduled_datetime.strftime("%-I:%M %p")
+                    # --- FIX: Replaced "%-I" with a cross-platform compatible method ---
+                    scheduled_clock = scheduled_datetime.strftime("%I:%M %p").lstrip("0")
                 except (ValueError, TypeError):
                     logging.warning(f"Could not parse scheduled time: {scheduled_time_str}")
 
@@ -484,6 +557,7 @@ def api_vehicle_predictions():
             })
     return jsonify(results)
 
+
 # -------------------------------------------------------------------
 # Main
 # -------------------------------------------------------------------
@@ -491,5 +565,4 @@ process_gtfs_data()
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
-
 
