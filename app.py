@@ -16,8 +16,8 @@ from google.transit import gtfs_realtime_pb2
 # -------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-STATIC_GTFS_URL = "https://dartfirststate.com/RiderInfo/Routes/gtfs_data/dartfirststate_de_us.zip"
-GTFS_RT_URL = "https://tmc.deldot.gov/gtfs/VehiclePositions.pb"
+STATIC_GTFS_URL = "https://tmc.deldot.gov/gtfs/dart.zip"
+GTFS_RT_URL = "https://api.goswift.ly/real-time/delaware/gtfs-rt-vehicle-positions"
 DEFAULT_SPEED_MS = 6.7
 gtfs_data = {}
 
@@ -56,9 +56,45 @@ def process_gtfs_data():
     logging.info("Downloading static GTFS data…")
     r = requests.get(STATIC_GTFS_URL, timeout=60)
     r.raise_for_status()
+
+    # --- CHANGE: This function is now fully service-aware ---
     with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-        gtfs_data["routes"] = pd.read_csv(z.open("routes.txt"), dtype={"route_id": str})[["route_id", "route_short_name", "route_long_name"]].to_dict("records")
-        trips_df = pd.read_csv(z.open("trips.txt"), dtype={"route_id": str, "trip_id": str, "shape_id": str, "direction_id": "Int64"})
+        # 1. Read all necessary files, including calendar files
+        routes_df = pd.read_csv(z.open("routes.txt"), dtype={"route_id": str})
+        trips_df = pd.read_csv(z.open("trips.txt"), dtype={"trip_id": str, "service_id": str})
+        calendar_df = pd.read_csv(z.open("calendar.txt"), dtype=str)
+        calendar_dates_df = pd.read_csv(z.open("calendar_dates.txt"), dtype=str)
+        
+        # 2. Determine today's active service IDs
+        ET = pytz.timezone('America/New_York')
+        today = datetime.now(ET)
+        today_str = today.strftime('%Y%m%d')
+        today_weekday = today.strftime('%A').lower() # e.g., 'wednesday'
+
+        # Get services from the regular weekly schedule (calendar.txt)
+        active_weekly_services = calendar_df[
+            (calendar_df[today_weekday] == '1') &
+            (calendar_df['start_date'] <= today_str) &
+            (calendar_df['end_date'] >= today_str)
+        ]
+        active_service_ids = set(active_weekly_services['service_id'])
+
+        # Apply exceptions for today (calendar_dates.txt)
+        today_exceptions = calendar_dates_df[calendar_dates_df['date'] == today_str]
+        for _, row in today_exceptions.iterrows():
+            if row['exception_type'] == '1': # Service added
+                active_service_ids.add(row['service_id'])
+            elif row['exception_type'] == '2': # Service removed
+                active_service_ids.discard(row['service_id'])
+        
+        logging.info(f"Found {len(active_service_ids)} active services for today.")
+
+        # 3. Filter trips to only include those running today
+        trips_df = trips_df[trips_df['service_id'].isin(active_service_ids)]
+        logging.info(f"Filtered to {len(trips_df)} trips running today.")
+        
+        # 4. Continue processing with the filtered data
+        gtfs_data["routes"] = routes_df[["route_id", "route_short_name", "route_long_name"]].to_dict("records")
         gtfs_data["stop_times_df"] = pd.read_csv(z.open("stop_times.txt"), dtype={"trip_id": str, "stop_id": str})
         gtfs_data["stops_dict"] = pd.read_csv(z.open("stops.txt"), dtype={"stop_id": str}).set_index("stop_id").to_dict("index")
         gtfs_data["trips_df"] = trips_df.set_index("trip_id")
@@ -72,8 +108,9 @@ def process_gtfs_data():
     gtfs_data["shapes"] = shapes
 
     route_info = {}
-    trips_with_shape = trips_df.dropna(subset=["shape_id", "direction_id"])
-    logging.info("Building route/direction info…")
+    # Use the already-filtered trips_df for this step
+    trips_with_shape = gtfs_data["trips_df"].reset_index().dropna(subset=["shape_id", "direction_id"])
+    logging.info("Building route/direction info based on today's trips…")
     for (route_id, direction_id), group in trips_with_shape.groupby(["route_id", "direction_id"]):
         if route_id not in route_info: route_info[route_id] = {}
         mode_shape = group["shape_id"].mode()
@@ -88,7 +125,8 @@ def process_gtfs_data():
             "trip_ids": set(group['trip_id'].unique())
         }
     gtfs_data["route_info"] = route_info
-    logging.info("GTFS static loaded.")
+    logging.info("GTFS static loaded and filtered for today's service.")
+
 
 # -------------------------------------------------------------------
 # Flask + HTML
@@ -113,7 +151,6 @@ HTML_TEMPLATE = """
   <div id="map" class="w-full h-screen z-0"></div>
   <div id="map-overlay" class="hidden md:hidden fixed inset-0 bg-black bg-opacity-50 z-20 transition-opacity duration-300"></div>
 
-  <!-- CHANGE: Hint is now at the top and starts hidden -->
   <div id="instruction-hint" class="absolute top-4 left-1/2 -translate-x-1/2 w-11/12 max-w-md bg-white/90 backdrop-blur-sm p-3 rounded-lg shadow-xl z-10 text-center text-sm text-gray-800 flex items-center justify-between transition-opacity duration-500 ease-in-out opacity-0 pointer-events-none">
     <span class="flex-grow">
       Now, tap a bus icon
@@ -187,16 +224,14 @@ HTML_TEMPLATE = """
     new L.Control.Locate({ position: 'topright' }).addTo(map);
 
     fetch('/api/routes').then(r => r.json()).then(routes => {
-      // FIX: Simplified the sort function to be more robust and prevent errors.
       routes.sort((a, b) => {
         const na = parseInt(a.route_short_name, 10);
         const nb = parseInt(b.route_short_name, 10);
-        if (!isNaN(na) && !isNaN(nb)) {
-            return na - nb;
-        }
+        if (!isNaN(na) && !isNaN(nb)) { return na - nb; }
         return (a.route_short_name || '').localeCompare(b.route_short_name || '');
       });
       const routeList = document.getElementById('route-list');
+      routeList.innerHTML = ''; // Clear previous list
       routes.forEach(route => {
         const item = document.createElement('div');
         item.className = 'p-3 my-1 cursor-pointer hover:bg-gray-200 rounded-md';
@@ -215,7 +250,7 @@ HTML_TEMPLATE = """
       dirC.innerHTML = '<p class="text-gray-500">Loading…</p>';
       fetch(`/api/route_directions/${routeId}`).then(r=>r.json()).then(directions=>{
         dirC.innerHTML = '';
-        if(!directions.length) { dirC.innerHTML = '<p class="text-red-500">No directions found.</p>'; return; }
+        if(!directions.length) { dirC.innerHTML = '<p class="text-center text-gray-500 font-medium">No service for this route today.</p>'; return; }
         directions.forEach(dir=>{
           const b=document.createElement('button');
           b.className='w-full text-left p-2 my-1 rounded-lg bg-gray-100 hover:bg-gray-200 font-medium';
@@ -229,7 +264,6 @@ HTML_TEMPLATE = """
 
     function selectDirection(directionId, btn) {
         selectedDirectionId = directionId;
-        // This logic correctly styles the selected direction button
         document.querySelectorAll('#directions-container button').forEach(el => {
             el.classList.remove('bg-blue-600', 'text-white', 'font-bold');
             el.classList.add('bg-gray-100', 'hover:bg-gray-200', 'font-medium');
@@ -245,7 +279,7 @@ HTML_TEMPLATE = """
         loadVehicleData();
         if (vehicleUpdateInterval) clearInterval(vehicleUpdateInterval);
         vehicleUpdateInterval = setInterval(loadVehicleData, 15000);
-        showHint(); // Show the floating hint
+        showHint();
     }
 
     function loadVehicleData() {
@@ -320,7 +354,17 @@ app = Flask(__name__)
 def index(): return Response(HTML_TEMPLATE, mimetype="text/html")
 
 @app.route("/api/routes")
-def api_routes(): return jsonify(gtfs_data.get("routes", []))
+def api_routes():
+    # --- CHANGE: Filter the routes list to only include those with active service today ---
+    active_routes = []
+    all_routes = gtfs_data.get("routes", [])
+    active_route_ids = gtfs_data.get("route_info", {}).keys()
+    
+    for route in all_routes:
+        if route['route_id'] in active_route_ids:
+            active_routes.append(route)
+            
+    return jsonify(active_routes)
 
 @app.route("/api/route_directions/<route_id>")
 def api_route_directions(route_id):
