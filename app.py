@@ -17,11 +17,9 @@ from google.transit import gtfs_realtime_pb2
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 STATIC_GTFS_URL = "https://dartfirststate.com/RiderInfo/Routes/gtfs_data/dartfirststate_de_us.zip"
-# --- NEW: URLs for the new real-time feeds ---
-# You will need to replace these with the correct, full URLs
+# --- CHANGE: Removed TripUpdates URL, renamed Vehicle URL for clarity ---
 GTFS_RT_VEHICLES_URL = "https://tmc.deldot.gov/gtfs/VehiclePositions.pb"
-GTFS_RT_TRIP_UPDATES_URL = "https://tmc.deldot.gov/gtfs/TripUpdates.pb"  # Replace with actual URL
-GTFS_RT_ALERTS_URL = "https://tmc.deldot.gov/gtfs/Alerts.pb"          # Replace with actual URL
+GTFS_RT_ALERTS_URL = "https://tmc.deldot.gov/gtfs/Alerts.pb" # Replace with actual URL if different
 
 DEFAULT_SPEED_MS = 6.7
 gtfs_data = {}
@@ -186,7 +184,6 @@ HTML_TEMPLATE = """
         <h1 class="text-2xl font-bold">DART Routes</h1>
         <button id="close-sidebar" class="md:hidden p-1"><svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg></button>
     </div>
-    <!-- NEW: Alert banner location -->
     <div id="alert-banner" class="hidden p-2.5 my-2 bg-red-100 border-l-4 border-red-500 text-red-800 text-sm rounded-r-lg"></div>
 
     <h3 class="text-sm font-semibold text-gray-600 mb-1 mt-2">Towards:</h3>
@@ -253,7 +250,6 @@ HTML_TEMPLATE = """
     });
     new L.Control.Locate({ position: 'topright' }).addTo(map);
 
-    // --- NEW: Fetch and display alerts on page load ---
     fetch('/api/alerts').then(r => r.json()).then(alerts => {
         if (alerts && alerts.length > 0) {
             alertBanner.innerHTML = alerts.map(a => `<strong>${a.header}</strong> ${a.description}`).join('<br>');
@@ -403,7 +399,7 @@ app = Flask(__name__)
 @app.route("/")
 def index(): return Response(HTML_TEMPLATE, mimetype="text/html")
 
-# --- NEW: API endpoint to fetch and parse alerts ---
+
 @app.route("/api/alerts")
 def api_alerts():
     try:
@@ -505,23 +501,6 @@ def api_vehicle_predictions():
     
     trip_id = trip_id.strip()
 
-    # --- MODIFIED: Fetch TripUpdates for accurate predictions ---
-    trip_updates = {}
-    try:
-        feed = gtfs_realtime_pb2.FeedMessage()
-        r = requests.get(GTFS_RT_TRIP_UPDATES_URL, timeout=10)
-        r.raise_for_status()
-        feed.ParseFromString(r.content)
-        for entity in feed.entity:
-            if entity.HasField("trip_update") and str(entity.trip_update.trip.trip_id).strip() == trip_id:
-                stop_time_updates = {}
-                for stu in entity.trip_update.stop_time_update:
-                    stop_time_updates[str(stu.stop_id).strip()] = stu
-                trip_updates[trip_id] = stop_time_updates
-                break # Found the trip we care about
-    except Exception:
-        logging.warning("Could not fetch or parse trip updates. Will fall back to simple ETA.")
-
     vehicle_pos, vehicle_speed = None, DEFAULT_SPEED_MS
     try:
         feed = gtfs_realtime_pb2.FeedMessage()
@@ -559,8 +538,6 @@ def api_vehicle_predictions():
     now_et = datetime.now(ET)
     today_midnight_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
     
-    current_trip_updates = trip_updates.get(trip_id, {})
-
     for stop_id in ordered_stops:
         stop_details = gtfs_data["stops_dict"].get(stop_id)
         if not stop_details: continue
@@ -569,37 +546,24 @@ def api_vehicle_predictions():
         stop_dist_along_shape = shape_cumdist[stop_idx]
 
         if stop_dist_along_shape > vehicle_dist_along_shape:
-            # --- MODIFIED: ETA calculation now uses TripUpdates first ---
-            eta_time = None
-            delay_minutes = None
+            remaining_dist = stop_dist_along_shape - vehicle_dist_along_shape
+            eta_seconds = remaining_dist / (vehicle_speed if vehicle_speed > 1 else DEFAULT_SPEED_MS)
 
-            stop_update = current_trip_updates.get(stop_id)
-            if stop_update and stop_update.HasField("arrival") and stop_update.arrival.time > 0:
-                eta_time = datetime.fromtimestamp(stop_update.arrival.time, tz=pytz.utc).astimezone(ET)
-                if stop_update.arrival.HasField("delay"):
-                    delay_minutes = int(round(stop_update.arrival.delay / 60.0))
-            
-            # Fallback to simple calculation if no official prediction is available
-            if not eta_time:
-                remaining_dist = stop_dist_along_shape - vehicle_dist_along_shape
-                eta_seconds = remaining_dist / (vehicle_speed if vehicle_speed > 1 else DEFAULT_SPEED_MS)
-                eta_time = now_et + timedelta(seconds=eta_seconds)
-
+            eta_time = now_et + timedelta(seconds=eta_seconds)
             eta_clock = eta_time.strftime("%I:%M %p").lstrip("0")
             minutes_from_now = max(1, int(round((eta_time - now_et).total_seconds() / 60.0)))
             eta_text = f"{minutes_from_now} min"
 
             scheduled_clock = "—"
+            delay_minutes = None
             scheduled_time_str = scheduled_times_map.get(stop_id)
             if scheduled_time_str:
                 try:
                     h, m, s = map(int, scheduled_time_str.split(':'))
                     scheduled_datetime = today_midnight_et + timedelta(hours=h, minutes=m, seconds=s)
                     scheduled_clock = scheduled_datetime.strftime("%I:%M %p").lstrip("0")
-                    # If delay wasn't in the feed, calculate it now
-                    if delay_minutes is None:
-                        delay_seconds = (eta_time - scheduled_datetime).total_seconds()
-                        delay_minutes = int(round(delay_seconds / 60.0))
+                    delay_seconds = (eta_time - scheduled_datetime).total_seconds()
+                    delay_minutes = int(round(delay_seconds / 60.0))
                 except (ValueError, TypeError):
                     logging.warning(f"Could not parse scheduled time: {scheduled_time_str}")
 
