@@ -17,7 +17,12 @@ from google.transit import gtfs_realtime_pb2
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 STATIC_GTFS_URL = "https://dartfirststate.com/RiderInfo/Routes/gtfs_data/dartfirststate_de_us.zip"
-GTFS_RT_URL = "https://tmc.deldot.gov/gtfs/VehiclePositions.pb"
+# --- NEW: URLs for the new real-time feeds ---
+# You will need to replace these with the correct, full URLs
+GTFS_RT_VEHICLES_URL = "https://tmc.deldot.gov/gtfs/VehiclePositions.pb"
+GTFS_RT_TRIP_UPDATES_URL = "https://tmc.deldot.gov/gtfs/TripUpdates.pb"  # Replace with actual URL
+GTFS_RT_ALERTS_URL = "https://tmc.deldot.gov/gtfs/Alerts.pb"          # Replace with actual URL
+
 DEFAULT_SPEED_MS = 6.7
 gtfs_data = {}
 
@@ -51,7 +56,6 @@ def nearest_shape_index(coords, point):
         if d < best_d:
             best_d, best_i = d, i
     return best_i
-
 
 def find_gtfs_file(zip_file, file_name):
     for name in zip_file.namelist():
@@ -89,7 +93,6 @@ def process_gtfs_data():
         calendar_dates_df = pd.read_csv(z.open(calendar_dates_path), dtype=str)
         stop_times_df = pd.read_csv(z.open(stop_times_path), dtype=str)
 
-        # Clean all linking IDs to prevent mismatches
         for df in [routes_df, trips_df, stop_times_df]:
             for col in ['route_id', 'trip_id', 'service_id']:
                 if col in df.columns:
@@ -104,27 +107,23 @@ def process_gtfs_data():
             (calendar_df[today_weekday] == '1') &
             (calendar_df['start_date'] <= today_str) &
             (calendar_df['end_date'] >= today_str)
-            ]
+        ]
         active_service_ids = set(active_weekly_services['service_id'])
 
         today_exceptions = calendar_dates_df[calendar_dates_df['date'] == today_str]
         for _, row in today_exceptions.iterrows():
-            if row['exception_type'] == '1':
-                active_service_ids.add(row['service_id'])
-            elif row['exception_type'] == '2':
-                active_service_ids.discard(row['service_id'])
+            if row['exception_type'] == '1': active_service_ids.add(row['service_id'])
+            elif row['exception_type'] == '2': active_service_ids.discard(row['service_id'])
 
         logging.info(f"Found {len(active_service_ids)} active services for today.")
         active_trips_df = trips_df[trips_df['service_id'].isin(active_service_ids)]
         logging.info(f"Filtered to {len(active_trips_df)} trips for building today's route list.")
 
-        # Store the COMPLETE, UNFILTERED trips dataframe for robust stop lookups.
         gtfs_data["trips_df"] = trips_df.set_index("trip_id")
-
+        
         gtfs_data["routes_dict"] = routes_df.set_index('route_id').to_dict('index')
         gtfs_data["stop_times_df"] = stop_times_df
-        gtfs_data["stops_dict"] = pd.read_csv(z.open(stops_path), dtype={"stop_id": str}).set_index("stop_id").to_dict(
-            "index")
+        gtfs_data["stops_dict"] = pd.read_csv(z.open(stops_path), dtype={"stop_id": str}).set_index("stop_id").to_dict("index")
         shapes_df = pd.read_csv(z.open(shapes_path), dtype={"shape_id": str})
 
     shapes = {}
@@ -145,10 +144,9 @@ def process_gtfs_data():
         if shape_id not in shapes: continue
         hs_mode = group["trip_headsign"].mode()
         headsign = hs_mode.iloc[0] if not hs_mode.empty else "Unknown Destination"
-        route_info[route_id][int(direction_id)] = {"shape_id": shape_id, "headsign": headsign}
+        route_info[route_id][int(direction_id)] = { "shape_id": shape_id, "headsign": headsign }
     gtfs_data["route_info"] = route_info
     logging.info("GTFS static loaded and filtered for today's service.")
-
 
 # -------------------------------------------------------------------
 # Flask + HTML
@@ -188,6 +186,9 @@ HTML_TEMPLATE = """
         <h1 class="text-2xl font-bold">DART Routes</h1>
         <button id="close-sidebar" class="md:hidden p-1"><svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg></button>
     </div>
+    <!-- NEW: Alert banner location -->
+    <div id="alert-banner" class="hidden p-2.5 my-2 bg-red-100 border-l-4 border-red-500 text-red-800 text-sm rounded-r-lg"></div>
+
     <h3 class="text-sm font-semibold text-gray-600 mb-1 mt-2">Towards:</h3>
     <div id="directions-container" class="border-b pb-2"></div>
     <div id="route-list" class="flex-grow overflow-y-auto mt-3 custom-scrollbar"></div>
@@ -212,6 +213,7 @@ HTML_TEMPLATE = """
     const menuToggleBtn = document.getElementById('menu-toggle'), closeSidebarBtn = document.getElementById('close-sidebar'), closeStopPanelBtn = document.getElementById('close-stop-panel');
     const stopListEl = document.getElementById('stop-list'), stopPanelTitle = document.getElementById('stop-panel-title');
     const instructionHint = document.getElementById('instruction-hint'), closeHintBtn = document.getElementById('close-hint-btn');
+    const alertBanner = document.getElementById('alert-banner');
 
     function isMobile() { return window.innerWidth < 768; }
     function showSidebar() { sidebar.classList.remove('-translate-x-full'); if(isMobile()) mapOverlay.classList.remove('hidden'); }
@@ -250,6 +252,14 @@ HTML_TEMPLATE = """
         }
     });
     new L.Control.Locate({ position: 'topright' }).addTo(map);
+
+    // --- NEW: Fetch and display alerts on page load ---
+    fetch('/api/alerts').then(r => r.json()).then(alerts => {
+        if (alerts && alerts.length > 0) {
+            alertBanner.innerHTML = alerts.map(a => `<strong>${a.header}</strong> ${a.description}`).join('<br>');
+            alertBanner.classList.remove('hidden');
+        }
+    });
 
     fetch('/api/routes').then(r => r.json()).then(routes => {
       allRoutesData = routes;
@@ -334,11 +344,11 @@ HTML_TEMPLATE = """
         const routeShortName = selectedRoute ? selectedRoute.route_short_name : '';
         stopPanelTitle.innerHTML = `
             <div>
-                <span class="text-xl font-semibold">Upcoming stops for Route ${routeShortName}</span>
+                <span class="text-xl font-semibold">Route ${routeShortName}</span>
                 <span class="block text-sm text-gray-500 font-normal">Vehicle #${props.vehicle_id}</span>
             </div>
         `;
-
+        
         stopListEl.innerHTML = '<p class="py-4">Loading predictions...</p>';
         stopsLayer.clearLayers();
         if (highlightedStopMarker) {
@@ -387,13 +397,32 @@ HTML_TEMPLATE = """
 """
 app = Flask(__name__)
 
-
 # -------------------------------------------------------------------
 # API Routes
 # -------------------------------------------------------------------
 @app.route("/")
 def index(): return Response(HTML_TEMPLATE, mimetype="text/html")
 
+# --- NEW: API endpoint to fetch and parse alerts ---
+@app.route("/api/alerts")
+def api_alerts():
+    try:
+        feed = gtfs_realtime_pb2.FeedMessage()
+        r = requests.get(GTFS_RT_ALERTS_URL, timeout=10)
+        r.raise_for_status()
+        feed.ParseFromString(r.content)
+        alerts = []
+        for entity in feed.entity:
+            if entity.HasField("alert"):
+                alert = entity.alert
+                alerts.append({
+                    "header": alert.header_text.translation[0].text if alert.header_text.translation else "Alert",
+                    "description": alert.description_text.translation[0].text if alert.description_text.translation else ""
+                })
+        return jsonify(alerts)
+    except Exception:
+        logging.exception("Could not fetch or parse alerts feed.")
+        return jsonify([])
 
 @app.route("/api/routes")
 def api_routes():
@@ -409,7 +438,7 @@ def api_routes():
                 'route_short_name': route_details.get('route_short_name'),
                 'route_long_name': route_details.get('route_long_name')
             })
-
+            
     logging.info(f"Returning {len(active_routes)} active routes to the frontend.")
     return jsonify(active_routes)
 
@@ -424,10 +453,8 @@ def api_route_directions(route_id):
 @app.route("/api/direction_details")
 def api_direction_details():
     route_id = request.args.get("route")
-    try:
-        direction_id = int(request.args.get("direction"))
-    except (ValueError, TypeError):
-        return jsonify({"error": "Invalid direction"}), 400
+    try: direction_id = int(request.args.get("direction"))
+    except (ValueError, TypeError): return jsonify({"error": "Invalid direction"}), 400
     details = gtfs_data.get("route_info", {}).get(route_id, {}).get(direction_id)
     if not details: return jsonify({"error": "Not found"}), 404
     shape_coords = gtfs_data["shapes"][details["shape_id"]]["coords"]
@@ -437,23 +464,21 @@ def api_direction_details():
 @app.route("/api/vehicles")
 def api_vehicles():
     route_id, direction_id_str = request.args.get("route"), request.args.get("direction")
-    try:
-        direction_id = int(direction_id_str)
-    except (ValueError, TypeError):
-        return jsonify({"error": "Invalid direction"}), 400
-
+    try: direction_id = int(direction_id_str)
+    except (ValueError, TypeError): return jsonify({"error": "Invalid direction"}), 400
+    
     trips_df_reset = gtfs_data.get("trips_df").reset_index()
     if trips_df_reset is None: return jsonify(geojson.FeatureCollection([]))
-
+    
     relevant_trips = trips_df_reset[
-        (trips_df_reset['route_id'] == route_id) &
+        (trips_df_reset['route_id'] == route_id) & 
         (trips_df_reset['direction_id'] == str(direction_id))
-        ]
+    ]
     valid_trip_ids = set(relevant_trips['trip_id'])
 
     try:
         feed = gtfs_realtime_pb2.FeedMessage()
-        r = requests.get(GTFS_RT_URL, timeout=15)
+        r = requests.get(GTFS_RT_VEHICLES_URL, timeout=15)
         r.raise_for_status()
         feed.ParseFromString(r.content)
         features = []
@@ -461,7 +486,7 @@ def api_vehicles():
             v = entity.vehicle
             if entity.HasField("vehicle") and v.HasField("position"):
                 live_trip_id = str(v.trip.trip_id).strip()
-
+                
                 if live_trip_id in valid_trip_ids:
                     props = {"trip_id": live_trip_id, "vehicle_id": getattr(v.vehicle, "label", v.vehicle.id),
                              "bearing": v.position.bearing}
@@ -477,13 +502,30 @@ def api_vehicles():
 def api_vehicle_predictions():
     trip_id = request.args.get("trip_id")
     if not trip_id: return jsonify([])
-
+    
     trip_id = trip_id.strip()
+
+    # --- MODIFIED: Fetch TripUpdates for accurate predictions ---
+    trip_updates = {}
+    try:
+        feed = gtfs_realtime_pb2.FeedMessage()
+        r = requests.get(GTFS_RT_TRIP_UPDATES_URL, timeout=10)
+        r.raise_for_status()
+        feed.ParseFromString(r.content)
+        for entity in feed.entity:
+            if entity.HasField("trip_update") and str(entity.trip_update.trip.trip_id).strip() == trip_id:
+                stop_time_updates = {}
+                for stu in entity.trip_update.stop_time_update:
+                    stop_time_updates[str(stu.stop_id).strip()] = stu
+                trip_updates[trip_id] = stop_time_updates
+                break # Found the trip we care about
+    except Exception:
+        logging.warning("Could not fetch or parse trip updates. Will fall back to simple ETA.")
 
     vehicle_pos, vehicle_speed = None, DEFAULT_SPEED_MS
     try:
         feed = gtfs_realtime_pb2.FeedMessage()
-        r = requests.get(GTFS_RT_URL, timeout=15)
+        r = requests.get(GTFS_RT_VEHICLES_URL, timeout=15)
         r.raise_for_status()
         feed.ParseFromString(r.content)
         for entity in feed.entity:
@@ -499,11 +541,9 @@ def api_vehicle_predictions():
 
     try:
         trip_details = gtfs_data['trips_df'].loc[trip_id]
-
         shape_id = trip_details['shape_id']
         shape_info = gtfs_data["shapes"][shape_id]
-        trip_stop_times = gtfs_data['stop_times_df'][gtfs_data['stop_times_df'].trip_id == trip_id].sort_values(
-            "stop_sequence")
+        trip_stop_times = gtfs_data['stop_times_df'][gtfs_data['stop_times_df'].trip_id == trip_id].sort_values("stop_sequence")
         scheduled_times_map = trip_stop_times.set_index('stop_id')['arrival_time'].to_dict()
         ordered_stops = trip_stop_times["stop_id"].tolist()
     except (KeyError, IndexError):
@@ -518,6 +558,8 @@ def api_vehicle_predictions():
     ET = pytz.timezone('America/New_York')
     now_et = datetime.now(ET)
     today_midnight_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    current_trip_updates = trip_updates.get(trip_id, {})
 
     for stop_id in ordered_stops:
         stop_details = gtfs_data["stops_dict"].get(stop_id)
@@ -527,25 +569,37 @@ def api_vehicle_predictions():
         stop_dist_along_shape = shape_cumdist[stop_idx]
 
         if stop_dist_along_shape > vehicle_dist_along_shape:
-            remaining_dist = stop_dist_along_shape - vehicle_dist_along_shape
-            eta_seconds = remaining_dist / (vehicle_speed if vehicle_speed > 1 else DEFAULT_SPEED_MS)
+            # --- MODIFIED: ETA calculation now uses TripUpdates first ---
+            eta_time = None
+            delay_minutes = None
 
-            eta_time = now_et + timedelta(seconds=eta_seconds)
-            # --- FIX: Replaced "%-I" with a cross-platform compatible method ---
+            stop_update = current_trip_updates.get(stop_id)
+            if stop_update and stop_update.HasField("arrival") and stop_update.arrival.time > 0:
+                eta_time = datetime.fromtimestamp(stop_update.arrival.time, tz=pytz.utc).astimezone(ET)
+                if stop_update.arrival.HasField("delay"):
+                    delay_minutes = int(round(stop_update.arrival.delay / 60.0))
+            
+            # Fallback to simple calculation if no official prediction is available
+            if not eta_time:
+                remaining_dist = stop_dist_along_shape - vehicle_dist_along_shape
+                eta_seconds = remaining_dist / (vehicle_speed if vehicle_speed > 1 else DEFAULT_SPEED_MS)
+                eta_time = now_et + timedelta(seconds=eta_seconds)
+
             eta_clock = eta_time.strftime("%I:%M %p").lstrip("0")
-            minutes = max(1, int(round(eta_seconds / 60.0)))
-            eta_text = f"{minutes} min"
+            minutes_from_now = max(1, int(round((eta_time - now_et).total_seconds() / 60.0)))
+            eta_text = f"{minutes_from_now} min"
 
-            scheduled_clock, delay_minutes = "—", None
+            scheduled_clock = "—"
             scheduled_time_str = scheduled_times_map.get(stop_id)
             if scheduled_time_str:
                 try:
                     h, m, s = map(int, scheduled_time_str.split(':'))
                     scheduled_datetime = today_midnight_et + timedelta(hours=h, minutes=m, seconds=s)
-                    delay_seconds = (eta_time - scheduled_datetime).total_seconds()
-                    delay_minutes = int(round(delay_seconds / 60.0))
-                    # --- FIX: Replaced "%-I" with a cross-platform compatible method ---
                     scheduled_clock = scheduled_datetime.strftime("%I:%M %p").lstrip("0")
+                    # If delay wasn't in the feed, calculate it now
+                    if delay_minutes is None:
+                        delay_seconds = (eta_time - scheduled_datetime).total_seconds()
+                        delay_minutes = int(round(delay_seconds / 60.0))
                 except (ValueError, TypeError):
                     logging.warning(f"Could not parse scheduled time: {scheduled_time_str}")
 
